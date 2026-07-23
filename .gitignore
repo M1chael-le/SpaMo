@@ -2,6 +2,7 @@
 node_modules/
 jspm_packages/
 venv/
+.ipynb_checkpoints
 
 # Build outputs
 dist/
