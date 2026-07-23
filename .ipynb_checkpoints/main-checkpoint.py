@@ -1,5 +1,6 @@
 #salloc -p dev_gpu_h100 -n 1 -t 30 --mem=50000 --gres=gpu:1
-#srun --jobid=6012838 python main.py -c configs/finetune.yaml -e bleu --train False --test True --ckpt /pfs/work9/workspace/scratch/ka_uvelk-BA/SpaMo/spamo.ckpt --logdir /home/ka/ka_stud/ka_uvelk/Test-Models/SpaMo/logs
+#srun python main.py -c configs/finetune.yaml -e bleu --train False --test True --ckpt /pfs/work9/workspace/scratch/ka_uvelk-BA/SpaMo/spamo.ckpt --logdir /pfs/work9/workspace/scratch/ka_uvelk-BA/SpaMo/logs
+
 
 import argparse
 import datetime

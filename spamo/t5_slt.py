@@ -135,8 +135,25 @@ class FlanT5SLT(AbstractSLT):
         print("T5 model frozen.")
 
     def set_container(self) -> None:
+        self.ids = []
+        self.glosses = []
         self.generated = []
         self.references = []
+
+    def save_translations(self, prefix: str) -> None:
+        """Write all collected translations to a text file under the run log directory."""
+        if self.trainer is None or not self.trainer.is_global_zero:
+            return
+        if not self.generated:
+            return
+
+        save_dir = os.path.join(self.logger.save_dir if self.logger else self.trainer.log_dir, "text")
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, f"{prefix}-outputs.txt")
+
+        with open(path, "w") as f:
+            for sample_id, gloss, ref, gen in zip(self.ids, self.glosses, self.references, self.generated):
+                f.write(f"ID: {sample_id}\nGloss: {gloss}\nReference: {ref}\nGenerated: {gen}\n\n")
 
     def prepare_models(self, t5_model: str) -> None:
         """
@@ -541,6 +558,8 @@ class FlanT5SLT(AbstractSLT):
             reference_strings = self.t5_tokenizer.batch_decode(output_tokens.input_ids, skip_special_tokens=True)
             reference_strings = [ref.lower() for ref in reference_strings]
 
+            self.ids.extend(inputs['ids'])
+            self.glosses.extend(inputs['gloss'])
             self.generated.extend(generated_strings)
             self.references.extend(reference_strings)
             
@@ -580,6 +599,7 @@ class FlanT5SLT(AbstractSLT):
 
         self.log_dict(eval_res, sync_dist=True)
 
+        self.save_translations("val")
         self.set_container()
 
     def on_test_epoch_end(self) -> None:
@@ -599,6 +619,8 @@ class FlanT5SLT(AbstractSLT):
         )
 
         self.log_dict(eval_res, sync_dist=True)
+
+        self.save_translations("test")
         self.set_container()
 
     def configure_optimizers(self):
