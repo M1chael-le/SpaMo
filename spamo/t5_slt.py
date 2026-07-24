@@ -9,8 +9,8 @@ import torch.nn.functional as F
 
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, T5ForConditionalGeneration
-from transformers import BertConfig, BertModel
-from peft import LoraConfig, get_peft_model, TaskType
+from transformers import BertConfig, BertModel, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 
 from spamo.tconv import TemporalConv
 from utils.helpers import create_mask, derangement
@@ -54,11 +54,13 @@ class FlanT5SLT(AbstractSLT):
         lora_r: int = 16,
         lora_alpha: int = 32,
         lora_dropout: float = 0.1,
+        quantize: Optional[str] = None,
         **kwargs
     ):
         super().__init__(**kwargs)
-        
+
         # Configuration parameters
+        self.quantize = quantize
         self.input_size = input_size
         self.prompt = prompt
         self.model_name = model_name
@@ -116,6 +118,9 @@ class FlanT5SLT(AbstractSLT):
 
     def _apply_lora(self) -> None:
         """Apply LoRA adapter to the T5 model."""
+        if self.quantize is not None:
+            self.t5_model = prepare_model_for_kbit_training(self.t5_model)
+
         lora_config = LoraConfig(
             r=self.lora_r,
             lora_alpha=self.lora_alpha,
@@ -126,6 +131,22 @@ class FlanT5SLT(AbstractSLT):
         )
         self.t5_model = get_peft_model(self.t5_model, lora_config)
         print("LoRA adapter applied to T5 model.")
+
+    def to(self, *args, **kwargs):
+        """bitsandbytes places the quantized T5 base (and peft's LoRA adapters on
+        top of it) directly on its target device via device_map at load time, and
+        raises if `.to()` is called on it again. Lightning still calls `.to(device)`
+        on the whole module during trainer setup, so skip t5_model here and move
+        everything else as usual."""
+        if self.quantize is None:
+            return super().to(*args, **kwargs)
+
+        t5_model = self.t5_model
+        self.t5_model = None
+        try:
+            return super().to(*args, **kwargs)
+        finally:
+            self.t5_model = t5_model
 
     def _freeze_model(self) -> None:
         """Freeze the T5 model parameters."""
@@ -164,10 +185,23 @@ class FlanT5SLT(AbstractSLT):
         """
         
         # Load the textual model
+        quantization_config = None
+        if self.quantize == "4bit":
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+        elif self.quantize == "8bit":
+            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+
         self.t5_model = T5ForConditionalGeneration.from_pretrained(
-            t5_model, 
+            t5_model,
             cache_dir=self.cache_dir,
-            torch_dtype=torch.bfloat16, 
+            torch_dtype=torch.bfloat16,
+            quantization_config=quantization_config,
+            device_map={"": torch.cuda.current_device()} if quantization_config is not None else None,
         )
         
         # Load the tokenizer
