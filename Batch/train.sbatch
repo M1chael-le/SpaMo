@@ -3,11 +3,11 @@
 #SBATCH --partition=gpu_h100
 #SBATCH --gres=gpu:1
 #SBATCH --mem=50000
-#SBATCH --time=06:00:00
+#SBATCH --time=72:00:00
 #SBATCH --output=logs/slurm-%x-%j.out
 #SBATCH --error=logs/slurm-%x-%j.err
 
-# Trains SpaMo from scratch (40 epochs on Phoenix14T take ~3h on one H100).
+# Trains SpaMo from scratch (~4 min per epoch on Phoenix14T on one H100).
 # Usage: sbatch train.sbatch [config]
 
 set -euo pipefail
