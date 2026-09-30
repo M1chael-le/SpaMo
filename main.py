@@ -185,7 +185,7 @@ def configure_callbacks(
             mode="max"
         ))
         callbacks.append(EarlyStopping(
-            monitor=model.monitor, verbose=True, patience=50, mode="max"
+            monitor=model.monitor, verbose=True, patience=15, mode="max"
         ))
     else:
         callbacks.append(ModelCheckpoint(
@@ -197,7 +197,7 @@ def configure_callbacks(
             mode="min"
         ))
         callbacks.append(EarlyStopping(
-            monitor=model.monitor, verbose=True, patience=50, mode="min"
+            monitor=model.monitor, verbose=True, patience=15, mode="min"
         ))
     
     # Setup callback for logging configuration
