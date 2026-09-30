@@ -2,6 +2,17 @@ from rouge_score import rouge_scorer
 from sacrebleu.metrics import BLEU, CHRF, TER
 
 
+class CharTokenizer:
+    """Character-level tokenizer for ROUGE on Chinese text.
+
+    rouge_score's default tokenizer drops everything outside [a-z0-9], which
+    removes all Chinese characters. Like the default, this drops punctuation
+    and whitespace, but keeps every remaining character as its own token.
+    """
+    def tokenize(self, text):
+        return [c for c in text.lower() if c.isalnum()]
+
+
 def evaluate_results(predictions, references, split="train", device='cpu', tokenizer='13a'):
     """
     Evaluate prediction results using BLEU and ROUGE metrics.
@@ -26,7 +37,10 @@ def evaluate_results(predictions, references, split="train", device='cpu', token
             log_dicts[f"{split}/bleu" + str(i)] = score
 
         # Calculate ROUGE-L score
-        scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+        if tokenizer == 'zh':
+            scorer = rouge_scorer.RougeScorer(['rougeL'], tokenizer=CharTokenizer())
+        else:
+            scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
         rouge_scores = [scorer.score(ref, pred)['rougeL'] for ref, pred in zip(references, predictions)]
         
         # Aggregate ROUGE-L scores (average precision, recall, and F1)

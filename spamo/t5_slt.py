@@ -137,6 +137,7 @@ class FlanT5SLT(AbstractSLT):
     def set_container(self) -> None:
         self.generated = []
         self.references = []
+        self.langs = []
 
     def prepare_models(self, t5_model: str) -> None:
         """
@@ -346,13 +347,15 @@ class FlanT5SLT(AbstractSLT):
                 glosses.append(sample['gloss'])
                 langs.append(sample['lang'])
                 
-                _ex_lang_trans = [
-                    f"{sample['en_text']}={sample['text']}",
-                    f"{sample['fr_text']}={sample['text']}",
-                    f"{sample['es_text']}={sample['text']}"
-                ]
-                _ex_lang_trans = _ex_lang_trans[:self.num_in_context]
-                ex_lang_translations.append(' '.join(_ex_lang_trans))
+                # Only Phoenix14T has en/fr/es translations for in-context examples
+                if self.use_in_context:
+                    _ex_lang_trans = [
+                        f"{sample['en_text']}={sample['text']}",
+                        f"{sample['fr_text']}={sample['text']}",
+                        f"{sample['es_text']}={sample['text']}"
+                    ]
+                    _ex_lang_trans = _ex_lang_trans[:self.num_in_context]
+                    ex_lang_translations.append(' '.join(_ex_lang_trans))
                 
                 # Handle too long sequences with random cropping
                 if nframe > max_frame_len:
@@ -373,7 +376,8 @@ class FlanT5SLT(AbstractSLT):
                         glor_values.append(sample['glor_value'])
                         glor_lengths.append(len(sample['glor_value']))
         
-        ex_lang_translations = derangement(ex_lang_translations)
+        if self.use_in_context:
+            ex_lang_translations = derangement(ex_lang_translations)
         
         # Return structured dictionary
         return {
@@ -543,7 +547,8 @@ class FlanT5SLT(AbstractSLT):
 
             self.generated.extend(generated_strings)
             self.references.extend(reference_strings)
-            
+            self.langs.extend(inputs['lang'])
+
             # Calculate evaluation metrics
             # eval_res = evaluate_results(
             #     predictions=generated_strings,
@@ -571,7 +576,7 @@ class FlanT5SLT(AbstractSLT):
             predictions=self.generated,
             references=self.references,
             split='val',
-            # tokenizer='zh' if outputs['lang'][0] == 'Chinese' else '13a',
+            tokenizer='zh' if self.langs and self.langs[0] == 'Chinese' else '13a',
             device=self.device
         )
         
@@ -595,6 +600,7 @@ class FlanT5SLT(AbstractSLT):
             predictions=self.generated,
             references=self.references,
             split='test',
+            tokenizer='zh' if self.langs and self.langs[0] == 'Chinese' else '13a',
             device=self.device
         )
 
