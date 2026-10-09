@@ -13,12 +13,13 @@
 # Run prune_scores.sbatch first so all tasks share the cached importance scores:
 #   jid=$(sbatch --parsable prune_scores.sbatch)
 #   sbatch --dependency=afterok:$jid prune_sweep.sbatch
-# Usage: sbatch prune_sweep.sbatch [ckpt] [config]
+# Usage: sbatch prune_sweep.sbatch [ckpt] [config] [run name prefix]
 
 set -euo pipefail
 
 CKPT="${1:-/pfs/work9/workspace/scratch/ka_uvelk-models/SpaMo/spamo.ckpt}"
 CONFIG="${2:-configs/prune.yaml}"
+NAME="${3:-prune}"
 LOG_DIR="/pfs/work9/workspace/scratch/ka_uvelk-models/SpaMo/logs"
 
 PCT=$((SLURM_ARRAY_TASK_ID * 10))
@@ -29,4 +30,4 @@ conda activate SpaMo
 cd /pfs/data6/home/ka/ka_stud/ka_uvelk/models/SpaMo
 
 srun python main.py -c "$CONFIG" -e bleu -l "$LOG_DIR" --ckpt "$CKPT" \
-    --head_ratio "$RATIO" --ffn_ratio "$RATIO" -n "prune${PCT}"
+    --head_ratio "$RATIO" --ffn_ratio "$RATIO" -n "${NAME}${PCT}"
