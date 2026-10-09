@@ -8,15 +8,16 @@
 #SBATCH --error=logs/slurm-%x-%j.err
 
 # Trains SpaMo from scratch (~4 min per epoch on Phoenix14T on one H100).
-# Usage: sbatch train.sbatch [config]
+# Usage: sbatch train.sbatch [config] [extra main.py args, e.g. --save_top_k 5]
 
 set -euo pipefail
 
 CONFIG="${1:-configs/finetune.yaml}"
+shift || true
 LOG_DIR="/pfs/work9/workspace/scratch/ka_uvelk-models/SpaMo/logs"
 
 source /home/ka/ka_stud/ka_uvelk/miniconda3/etc/profile.d/conda.sh
 conda activate SpaMo
 cd /pfs/data6/home/ka/ka_stud/ka_uvelk/models/SpaMo
 
-srun python main.py -c "$CONFIG" -e bleu -l "$LOG_DIR"
+srun python main.py -c "$CONFIG" -e bleu -l "$LOG_DIR" "$@"

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union, Any
 
 import pytorch_lightning as pl
+import torch
 from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
@@ -14,6 +15,7 @@ from pytorch_lightning.trainer import Trainer
 
 from utils.helpers import instantiate_from_config
 from spamo.callbacks import SetupCallback
+from spamo.pruning import compute_importance, select_to_prune
 
 
 def str2bool(v: Any) -> bool:
@@ -92,6 +94,22 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '-e', '--evaluation', type=str, default='mse',
         help='Evaluation metric to use'
+    )
+    parser.add_argument(
+        '--save_top_k', type=int, default=1,
+        help='Number of best checkpoints to keep'
+    )
+    parser.add_argument(
+        '--head_ratio', type=float, default=None,
+        help='Fraction of attention heads to prune (overrides pruning.head_ratio)'
+    )
+    parser.add_argument(
+        '--ffn_ratio', type=float, default=None,
+        help='Fraction of FFN neurons to prune (overrides pruning.ffn_ratio)'
+    )
+    parser.add_argument(
+        '--scores_only', action='store_true', default=False,
+        help='Only compute and cache pruning importance scores, then exit'
     )
     return parser
 
@@ -181,7 +199,7 @@ def configure_callbacks(
             filename="epoch={epoch:05}-step={step:07}-bleu4={val/bleu4:.2f}", 
             monitor=model.monitor, 
             auto_insert_metric_name=False, 
-            save_top_k=1, 
+            save_top_k=opt.save_top_k, 
             mode="max"
         ))
         callbacks.append(EarlyStopping(
@@ -193,7 +211,7 @@ def configure_callbacks(
             filename="epoch={epoch:05}-step={step:07}-loss={val/contra_loss:.4f}", 
             monitor=model.monitor, 
             auto_insert_metric_name=False, 
-            save_top_k=1, 
+            save_top_k=opt.save_top_k, 
             mode="min"
         ))
         callbacks.append(EarlyStopping(
@@ -256,6 +274,45 @@ def configure_logger(logger_type: str, logdir: str, nowname: str) -> Dict:
     return logger_configs[logger_type]
 
 
+def get_pruning_scores(model: pl.LightningModule, data: pl.LightningDataModule, pruning_config: OmegaConf) -> Dict:
+    """Load cached importance scores, or compute and cache them."""
+    scores_path = pruning_config.get("scores_path")
+    if scores_path and os.path.exists(scores_path):
+        print(f"Loading pruning scores from {scores_path}")
+        return torch.load(scores_path)
+
+    scores = compute_importance(model, data.train_dataloader(), pruning_config.get("num_calib_batches", 256))
+    if scores_path:
+        os.makedirs(os.path.dirname(scores_path), exist_ok=True)
+        torch.save(scores, scores_path)
+        print(f"Saved pruning scores to {scores_path}")
+    return scores
+
+
+def run_pruning(
+    opt: argparse.Namespace,
+    model: pl.LightningModule,
+    data: pl.LightningDataModule,
+    trainer: Trainer,
+    scores: Dict,
+    pruning_config: OmegaConf
+) -> None:
+    """Prune the loaded model, evaluate it, fine-tune to recover, and test again."""
+    head_ratio = opt.head_ratio if opt.head_ratio is not None else pruning_config.get("head_ratio", 0.0)
+    ffn_ratio = opt.ffn_ratio if opt.ffn_ratio is not None else pruning_config.get("ffn_ratio", 0.0)
+    spec = select_to_prune(scores, head_ratio, ffn_ratio, pruning_config.get("scope", "per_layer"))
+    print(f"Pruning with head_ratio={head_ratio}, ffn_ratio={ffn_ratio}")
+    model.prune(spec)
+
+    if pruning_config.get("eval_before_recovery", True):
+        model.test_log_prefix = 'test_pruned'
+        trainer.test(model, data)
+        model.test_log_prefix = 'test'
+
+    trainer.fit(model, data)
+    trainer.test(model, data, ckpt_path=None if opt.fast_dev_run else "best")
+
+
 def main():
     """Main entry point for training and testing."""
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
@@ -302,7 +359,17 @@ def main():
     
     # Instantiate model
     model = instantiate_from_config(config.model)
-    
+
+    # Pruning: load the trained checkpoint and get importance scores before the trainer exists
+    pruning_config = config.get("pruning") if opt.train else None
+    if pruning_config is not None:
+        if ckpt is None:
+            raise ValueError("Pruning requires --ckpt pointing to a trained checkpoint")
+        model.load_pretrained_weights(ckpt)
+        scores = get_pruning_scores(model, data, pruning_config)
+        if opt.scores_only:
+            return
+
     # Configure trainer with callbacks and logger for non-dev runs
     if not opt.fast_dev_run:
         logger_cfg = configure_logger("wandb", logdir, nowname)
@@ -316,7 +383,9 @@ def main():
     trainer = Trainer(**vars(trainer_opt))
     
     # Run training or testing
-    if opt.train:
+    if pruning_config is not None:
+        run_pruning(opt, model, data, trainer, scores, pruning_config)
+    elif opt.train:
         if opt.resume is not None:
             trainer.fit(model, data, ckpt_path=ckpt)
         else:

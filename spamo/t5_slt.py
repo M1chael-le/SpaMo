@@ -18,7 +18,8 @@ from spamo.mm_projector import build_vision_projector
 from utils.evaluate import evaluate_results
 from spamo.clip_loss import clip_loss
 from spamo.asb import AbstractSLT
-from transformers import get_cosine_schedule_with_warmup
+from spamo.pruning import apply_prune_spec, count_params, spec_summary
+from transformers import get_cosine_schedule_with_warmup, get_cosine_with_min_lr_schedule_with_warmup
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -54,6 +55,8 @@ class FlanT5SLT(AbstractSLT):
         lora_r: int = 16,
         lora_alpha: int = 32,
         lora_dropout: float = 0.1,
+        lr_warmup_steps: Optional[int] = None,
+        min_lr: Optional[float] = None,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -80,7 +83,11 @@ class FlanT5SLT(AbstractSLT):
         self.lora_r = lora_r
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
-        
+        self.lr_warmup_steps = lr_warmup_steps
+        self.min_lr = min_lr
+        self.prune_spec = None
+        self.test_log_prefix = 'test'
+
         self.prepare_models(model_name)
 
         # Apply the selected tuning strategy
@@ -111,8 +118,36 @@ class FlanT5SLT(AbstractSLT):
     
     def load_pretrained_weights(self, checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.on_load_checkpoint(checkpoint)
         self.load_state_dict(checkpoint['state_dict'])
         print(f'Checkpoint is loaded from {checkpoint_path}.')
+
+    def prune(self, spec: Dict) -> None:
+        """Physically remove the attention heads / FFN neurons in spec from the T5 model."""
+        if self.tuning_type == 'lora':
+            self.t5_model = self.t5_model.merge_and_unload()
+
+        n_before = count_params(self.t5_model)
+        apply_prune_spec(self.t5_model, spec)
+        n_after = count_params(self.t5_model)
+        print(f"Pruning: {spec_summary(spec)}; T5 params {n_before / 1e6:.1f}M -> {n_after / 1e6:.1f}M "
+              f"({100 * (1 - n_after / n_before):.1f}% removed)")
+
+        # Re-apply the tuning strategy (pruned layers are new, trainable modules)
+        if self.tuning_type == 'freeze':
+            self._freeze_model()
+        elif self.tuning_type == 'lora':
+            self._apply_lora()
+        self.prune_spec = spec
+
+    def on_save_checkpoint(self, checkpoint: Dict) -> None:
+        checkpoint['prune_spec'] = self.prune_spec
+
+    def on_load_checkpoint(self, checkpoint: Dict) -> None:
+        # Rebuild the pruned structure before the state dict is loaded
+        spec = checkpoint.get('prune_spec')
+        if spec is not None and self.prune_spec is None:
+            self.prune(spec)
 
     def _apply_lora(self) -> None:
         """Apply LoRA adapter to the T5 model."""
@@ -603,6 +638,8 @@ class FlanT5SLT(AbstractSLT):
             tokenizer='zh' if self.langs and self.langs[0] == 'Chinese' else '13a',
             device=self.device
         )
+        # e.g. 'test_pruned/bleu4' for the evaluation before recovery fine-tuning
+        eval_res = {k.replace('test/', f'{self.test_log_prefix}/', 1): v for k, v in eval_res.items()}
 
         self.log_dict(eval_res, sync_dist=True)
         self.set_container()
@@ -633,13 +670,25 @@ class FlanT5SLT(AbstractSLT):
             if hasattr(self.trainer, 'accumulate_grad_batches'):
                 total_steps = total_steps // self.trainer.accumulate_grad_batches
         
-        warmup_steps = int(total_steps * 0.1)
+        if self.lr_warmup_steps is not None:
+            warmup_steps = self.lr_warmup_steps
+        else:
+            warmup_steps = int(total_steps * 0.1)
 
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer=optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
-        )
+        if self.min_lr is not None:
+            # Cosine decay to min_lr instead of 0 (SpaMo paper, Appendix A)
+            scheduler = get_cosine_with_min_lr_schedule_with_warmup(
+                optimizer=optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_steps,
+                min_lr=self.min_lr,
+            )
+        else:
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer=optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_steps,
+            )
 
         return {
             "optimizer": optimizer,
