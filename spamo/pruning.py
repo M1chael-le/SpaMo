@@ -232,8 +232,63 @@ def apply_prune_spec(t5: nn.Module, spec: Dict) -> None:
                 setattr(ffn, w, _prune_linear(getattr(ffn, w), keep, dim=0))
         ffn.wo = _prune_linear(ffn.wo, keep, dim=1)
 
+    # Whole blocks last: head / FFN names above use the original block numbering
+    drop_blocks(t5, spec.get("blocks", {}))
+
+
+def set_blocks(t5: nn.Module, stack_name: str, blocks: List[nn.Module]) -> None:
+    """
+    Install `blocks` as the encoder/decoder stack: renumber the attention layer_idx
+    used by the generation cache and update the layer counts in the configs.
+    """
+    t5 = _base_model(t5)
+    stack = getattr(t5, stack_name)
+    assert blocks[0].layer[0].SelfAttention.has_relative_attention_bias, (
+        "Block 0 holds the relative position bias for the whole stack and must be kept"
+    )
+    for idx, block in enumerate(blocks):
+        for layer in block.layer:
+            for attn_name in ("SelfAttention", "EncDecAttention"):
+                if hasattr(layer, attn_name):
+                    getattr(layer, attn_name).layer_idx = idx
+    stack.block = nn.ModuleList(blocks)
+    # Each stack has its own copy of the config. The top-level num_layers is left
+    # unchanged: generate() sizes its decoder cache from it, so it must stay >= the
+    # decoder depth even when the encoder is shallower (extra cache slots stay unused).
+    stack.config.num_layers = len(blocks)
+    if stack_name == "decoder":
+        t5.config.num_decoder_layers = len(blocks)
+
+
+def least_important_blocks(scan: Dict, stack_name: str, k: int) -> List[int]:
+    """
+    The k blocks of a stack whose individual removal increased the dev loss least,
+    from a scripts/layer_scan.py result. Block 0 is never selected.
+    """
+    deltas = {int(key.split(".")[1]): d for key, d in scan["single_delta"].items()
+              if key.split(".")[0] == stack_name}
+    deltas.pop(0, None)  # block 0 holds the relative position bias
+    if k > len(deltas):
+        raise ValueError(f"Cannot drop {k} {stack_name} blocks, only {len(deltas)} besides block 0")
+    return sorted(sorted(deltas, key=deltas.get)[:k])
+
+
+def drop_blocks(t5: nn.Module, spec: Dict[str, List[int]]) -> None:
+    """Remove whole blocks, e.g. spec = {"encoder": [5, 22], "decoder": [23]} (original indices)."""
+    t5 = _base_model(t5)
+    for stack_name, idx in spec.items():
+        if not idx:
+            continue
+        drop = set(idx)
+        blocks = list(getattr(t5, stack_name).block)
+        set_blocks(t5, stack_name, [b for i, b in enumerate(blocks) if i not in drop])
+
 
 def spec_summary(spec: Dict) -> str:
     n_heads = sum(len(v) for v in spec.get("heads", {}).values())
     n_ffn = sum(len(v) for v in spec.get("ffn", {}).values())
-    return f"pruned {n_heads} attention heads, {n_ffn} FFN neurons"
+    summary = f"pruned {n_heads} attention heads, {n_ffn} FFN neurons"
+    for stack_name, idx in spec.get("blocks", {}).items():
+        if idx:
+            summary += f", dropped {stack_name} blocks {sorted(idx)}"
+    return summary

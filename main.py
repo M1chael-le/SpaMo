@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import glob
+import json
 import os
 import sys
 from pathlib import Path
@@ -15,7 +16,7 @@ from pytorch_lightning.trainer import Trainer
 
 from utils.helpers import instantiate_from_config
 from spamo.callbacks import SetupCallback
-from spamo.pruning import compute_importance, select_to_prune
+from spamo.pruning import compute_importance, least_important_blocks, select_to_prune
 
 
 def str2bool(v: Any) -> bool:
@@ -106,6 +107,14 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--ffn_ratio', type=float, default=None,
         help='Fraction of FFN neurons to prune (overrides pruning.ffn_ratio)'
+    )
+    parser.add_argument(
+        '--drop_encoder', type=int, default=None,
+        help='Number of whole encoder blocks to drop (overrides pruning.drop_encoder)'
+    )
+    parser.add_argument(
+        '--drop_decoder', type=int, default=None,
+        help='Number of whole decoder blocks to drop (overrides pruning.drop_decoder)'
     )
     parser.add_argument(
         '--scores_only', action='store_true', default=False,
@@ -274,6 +283,19 @@ def configure_logger(logger_type: str, logdir: str, nowname: str) -> Dict:
     return logger_configs[logger_type]
 
 
+def pruning_amounts(opt: argparse.Namespace, pruning_config: OmegaConf) -> Dict:
+    """Head / FFN ratios and numbers of dropped blocks; CLI values override the config."""
+    def pick(name, default):
+        value = getattr(opt, name)
+        return value if value is not None else pruning_config.get(name, default)
+    return {
+        "head_ratio": pick("head_ratio", 0.0),
+        "ffn_ratio": pick("ffn_ratio", 0.0),
+        "drop_encoder": pick("drop_encoder", 0),
+        "drop_decoder": pick("drop_decoder", 0),
+    }
+
+
 def get_pruning_scores(model: pl.LightningModule, data: pl.LightningDataModule, pruning_config: OmegaConf) -> Dict:
     """Load cached importance scores, or compute and cache them."""
     scores_path = pruning_config.get("scores_path")
@@ -294,14 +316,25 @@ def run_pruning(
     model: pl.LightningModule,
     data: pl.LightningDataModule,
     trainer: Trainer,
-    scores: Dict,
+    scores: Optional[Dict],
     pruning_config: OmegaConf
 ) -> None:
     """Prune the loaded model, evaluate it, fine-tune to recover, and test again."""
-    head_ratio = opt.head_ratio if opt.head_ratio is not None else pruning_config.get("head_ratio", 0.0)
-    ffn_ratio = opt.ffn_ratio if opt.ffn_ratio is not None else pruning_config.get("ffn_ratio", 0.0)
-    spec = select_to_prune(scores, head_ratio, ffn_ratio, pruning_config.get("scope", "per_layer"))
-    print(f"Pruning with head_ratio={head_ratio}, ffn_ratio={ffn_ratio}")
+    amounts = pruning_amounts(opt, pruning_config)
+    if scores is not None:
+        spec = select_to_prune(scores, amounts["head_ratio"], amounts["ffn_ratio"], pruning_config.get("scope", "per_layer"))
+    else:
+        spec = {"heads": {}, "ffn": {}}
+
+    # Whole blocks, ranked by a scripts/layer_scan.py result for the same checkpoint
+    if amounts["drop_encoder"] or amounts["drop_decoder"]:
+        with open(pruning_config.layer_scan) as fh:
+            scan = json.load(fh)
+        spec["blocks"] = {
+            "encoder": least_important_blocks(scan, "encoder", amounts["drop_encoder"]),
+            "decoder": least_important_blocks(scan, "decoder", amounts["drop_decoder"]),
+        }
+    print(f"Pruning with {amounts}")
     model.prune(spec)
 
     if pruning_config.get("eval_before_recovery", True):
@@ -366,7 +399,11 @@ def main():
         if ckpt is None:
             raise ValueError("Pruning requires --ckpt pointing to a trained checkpoint")
         model.load_pretrained_weights(ckpt)
-        scores = get_pruning_scores(model, data, pruning_config)
+        amounts = pruning_amounts(opt, pruning_config)
+        # Head / FFN importance scores are only needed when heads or neurons are pruned
+        scores = None
+        if opt.scores_only or amounts["head_ratio"] > 0 or amounts["ffn_ratio"] > 0:
+            scores = get_pruning_scores(model, data, pruning_config)
         if opt.scores_only:
             return
 
